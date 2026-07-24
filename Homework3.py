@@ -1,255 +1,217 @@
+"""
+Simple News Trading System for Bitcoin
+Reads local CSV files: bitcoin_price.csv (columns: Date, Close)
+and news.csv (columns: Date, Text).
+If files not found, downloads price data from Yahoo Finance and creates synthetic news.
+Runs backtest, prints annualized profit and comparison with Buy&Hold.
+"""
+
 import pandas as pd
 import numpy as np
-import akshare as ak
+from textblob import TextBlob
 from datetime import datetime, timedelta
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-import time
 import warnings
-
 warnings.filterwarnings('ignore')
 
-
-# ---------- 1. 下载价格历史（使用 akshare，国内稳定） ----------
-def fetch_price_data(symbol="600519", start_date="2025-07-23", end_date="2026-07-23"):
-    """
-    使用 akshare 获取 A 股日线数据（后复权）
-    symbol: 股票代码，如 '600519' 贵州茅台
-    """
-    print(f"📥 正在从 akshare 下载 {symbol} 从 {start_date} 到 {end_date} 的价格数据...")
+# ------------------ 1. Data Loading ------------------
+def load_price_data(price_file='bitcoin_price.csv'):
+    """Load price data from local CSV or download if missing."""
     try:
-        # 获取日线历史数据
-        df = ak.stock_zh_a_hist(
-            symbol=symbol,
-            period="daily",
-            start_date=start_date,
-            end_date=end_date,
-            adjust="qfq"  # 前复权，保持价格连续性
-        )
-        if df.empty:
-            raise ValueError("未获取到数据，请检查股票代码或日期范围")
+        df = pd.read_csv(price_file, parse_dates=['Date'])
+        # Ensure required columns
+        if 'Close' not in df.columns:
+            # try to find a close-like column
+            close_candidates = [col for col in df.columns if 'close' in col.lower()]
+            if close_candidates:
+                df.rename(columns={close_candidates[0]: 'Close'}, inplace=True)
+            else:
+                raise ValueError("No 'Close' column found in price file.")
+        # set Date as index
+        df.set_index('Date', inplace=True)
+        df.sort_index(inplace=True)
+        return df['Close']
+    except FileNotFoundError:
+        print("Price file not found. Downloading Bitcoin price from Yahoo Finance...")
+        import yfinance as yf
+        end = datetime.now()
+        start = end - timedelta(days=400)  # at least one year
+        ticker = yf.Ticker('BTC-USD')
+        hist = ticker.history(start=start, end=end)
+        if hist.empty:
+            raise RuntimeError("Failed to download price data.")
+        price_series = hist['Close']
+        # save for future use
+        price_series.to_csv(price_file, header=['Close'])
+        print(f"Downloaded and saved to {price_file}")
+        return price_series
 
-        # 重命名列以符合统一格式
-        df = df.rename(columns={
-            '日期': 'Date',
-            '开盘': 'Open',
-            '收盘': 'Close',
-            '最高': 'High',
-            '最低': 'Low',
-            '成交量': 'Volume'
-        })
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df.set_index('Date')
-        # 只保留所需列
-        df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-        print(f"✅ 价格数据下载完成，共 {len(df)} 个交易日")
-        return df
-    except Exception as e:
-        print(f"❌ 价格数据下载失败: {e}")
-        # 如果 akshare 失败，生成模拟价格数据（仅演示）
-        print("🔄 生成模拟价格数据用于演示...")
-        return generate_mock_price(start_date, end_date)
-
-
-def generate_mock_price(start_date, end_date):
-    """生成模拟价格数据（当真实数据获取失败时使用）"""
-    dates = pd.date_range(start=start_date, end=end_date, freq='B')  # 仅工作日
-    np.random.seed(42)
-    n = len(dates)
-    price = 100.0
-    prices = []
-    for _ in range(n):
-        change = np.random.normal(0, 0.02)
-        price = price * (1 + change)
-        prices.append(price)
-    df = pd.DataFrame({
-        'Open': prices,
-        'High': [p * (1 + abs(np.random.normal(0, 0.01))) for p in prices],
-        'Low': [p * (1 - abs(np.random.normal(0, 0.01))) for p in prices],
-        'Close': [p * (1 + np.random.normal(0, 0.005)) for p in prices],
-        'Volume': np.random.randint(1000, 10000, n)
-    }, index=dates)
-    print(f"✅ 生成模拟价格 {len(df)} 条")
-    return df
-
-
-# ---------- 2. 下载官方新闻源（尝试 akshare，失败则模拟） ----------
-def fetch_news(symbol="600519", max_days=365):
-    """
-    使用 akshare 获取股票相关新闻（东方财富源）
-    由于免费接口通常只返回最近几十条，我们将获取到的与模拟新闻合并以覆盖一年
-    """
-    print(f"📰 正在从 akshare 获取 {symbol} 相关新闻...")
-    all_news = []
+def load_news_data(news_file='news.csv'):
+    """Load news data from local CSV or generate synthetic if missing."""
     try:
-        # 获取新闻列表（东方财富）
-        news_df = ak.stock_news_em(symbol=symbol)
-        if not news_df.empty:
-            # 转换为统一格式
-            for _, row in news_df.iterrows():
-                pub_time = pd.to_datetime(row['发布时间'])
-                # 只保留一年内的新闻
-                if pub_time >= datetime.now() - timedelta(days=max_days):
-                    all_news.append({
-                        'datetime': pub_time,
-                        'title': row['新闻标题'],
-                        'body': row.get('新闻内容', '') or row['新闻标题'],  # 部分接口无正文
-                        'source': '东方财富'
-                    })
-            print(f"   获取到 {len(all_news)} 条东方财富新闻")
-    except Exception as e:
-        print(f"⚠️  akshare 新闻获取失败: {e}")
+        df = pd.read_csv(news_file, parse_dates=['Date'])
+        if 'Text' not in df.columns:
+            # try to find a text column
+            text_candidates = [col for col in df.columns if 'text' in col.lower() or 'content' in col.lower() or 'title' in col.lower()]
+            if text_candidates:
+                df.rename(columns={text_candidates[0]: 'Text'}, inplace=True)
+            else:
+                raise ValueError("No text column found in news file.")
+        df.set_index('Date', inplace=True)
+        df.sort_index(inplace=True)
+        return df['Text']
+    except FileNotFoundError:
+        print("News file not found. Generating synthetic news based on price movements...")
+        # Generate news from price changes
+        price = load_price_data()
+        # Create news for each day with random sentiment correlated with daily return
+        dates = price.index
+        texts = []
+        for i in range(1, len(dates)):
+            ret = (price.iloc[i] - price.iloc[i-1]) / price.iloc[i-1]
+            # positive return -> positive news, negative return -> negative news
+            sentiment_score = np.clip(ret * 20, -1, 1)  # scale
+            if sentiment_score > 0.3:
+                text = "Bitcoin surges on strong demand and positive market sentiment."
+            elif sentiment_score > 0.1:
+                text = "Bitcoin shows moderate gains amid cautious optimism."
+            elif sentiment_score < -0.3:
+                text = "Bitcoin plummets as regulatory concerns weigh on investors."
+            elif sentiment_score < -0.1:
+                text = "Bitcoin declines slightly in a risk-off environment."
+            else:
+                text = "Bitcoin trades sideways with low volatility."
+            # add some randomness
+            if np.random.rand() < 0.2:
+                text = "Uncertainty looms as Bitcoin faces mixed signals."
+            texts.append(text)
+        # create series with dates (skip first day)
+        news_series = pd.Series(texts, index=dates[1:], name='Text')
+        # save
+        news_series.to_csv(news_file, header=['Text'])
+        print(f"Generated synthetic news and saved to {news_file}")
+        return news_series
 
-    # 如果新闻数量太少（少于50条），用模拟新闻填充以覆盖整个周期
-    if len(all_news) < 50:
-        print(f"   真实新闻不足，补充模拟新闻以覆盖一年时间...")
-        mock_news = generate_mock_news(symbol, max_days)
-        all_news.extend(mock_news)
+# ------------------ 2. Sentiment Analysis ------------------
+def get_sentiment(text):
+    """Return polarity score from -1 (negative) to +1 (positive)."""
+    return TextBlob(text).sentiment.polarity
 
-    df_news = pd.DataFrame(all_news)
-    if df_news.empty:
-        print("❌ 未能获取任何新闻，生成模拟新闻")
-        df_news = pd.DataFrame(generate_mock_news(symbol, max_days))
+# ------------------ 3. Trading Signal ------------------
+def generate_signals(news_series, price_series, threshold=0.1):
+    """
+    For each day with news, compute average sentiment and generate signal:
+    Buy if sentiment > threshold, Sell if sentiment < -threshold, else Hold.
+    Returns DataFrame with signals.
+    """
+    # Align news with price dates (only days present in both)
+    common_dates = news_series.index.intersection(price_series.index)
+    if len(common_dates) == 0:
+        raise ValueError("No overlapping dates between news and price data.")
 
-    df_news = df_news.drop_duplicates(subset=['title', 'datetime'])
-    df_news = df_news.sort_values('datetime')
-    print(
-        f"✅ 新闻数据准备完成，共 {len(df_news)} 条（时间范围: {df_news['datetime'].min()} 至 {df_news['datetime'].max()}）")
-    return df_news
+    # Group by date (in case multiple news per day) and average sentiment
+    daily_news = news_series.loc[common_dates]
+    daily_sentiment = daily_news.groupby(daily_news.index).apply(lambda x: x.apply(get_sentiment).mean())
 
+    # Generate signals
+    signals = pd.Series(index=daily_sentiment.index, dtype=object)
+    signals[daily_sentiment > threshold] = 'BUY'
+    signals[daily_sentiment < -threshold] = 'SELL'
+    signals[(daily_sentiment >= -threshold) & (daily_sentiment <= threshold)] = 'HOLD'
+    return signals
 
-def generate_mock_news(symbol, max_days):
-    """生成模拟新闻（情感随机）"""
-    start_date = datetime.now() - timedelta(days=max_days)
-    dates = pd.date_range(start=start_date, end=datetime.now(), freq='D')
-    np.random.seed(123)
-    news_list = []
-    for d in dates:
-        # 每天随机生成 0~3 条
-        for _ in range(np.random.randint(0, 4)):
-            score = np.random.uniform(-1, 1)
-            sentiment = "positive" if score > 0.1 else "negative" if score < -0.1 else "neutral"
-            news_list.append({
-                'datetime': d + pd.Timedelta(hours=np.random.randint(0, 23)),
-                'title': f"{symbol} 相关新闻 - {sentiment}",
-                'body': f"模拟新闻内容：今日市场情绪 {sentiment}。",
-                'source': '模拟'
-            })
-    return news_list
+# ------------------ 4. Backtest ------------------
+def backtest(price_series, signals, initial_cash=10000):
+    """
+    Simulate trading: start with cash only.
+    On BUY: invest all cash into Bitcoin.
+    On SELL: sell all Bitcoin holdings.
+    HOLD: do nothing.
+    Returns final value and daily portfolio values.
+    """
+    # Create a full date range from price_series
+    full_dates = price_series.index
+    # Merge signals into full timeline (forward fill? Actually we only act on signal days)
+    # We'll process day by day
+    cash = initial_cash
+    holdings = 0.0  # amount of BTC
+    portfolio = []  # list of (date, total_value)
 
+    # Get price at each date
+    for date in full_dates:
+        price = price_series.loc[date]
+        # Check if there is a signal for this date
+        if date in signals.index:
+            signal = signals.loc[date]
+            if signal == 'BUY' and cash > 0:
+                # buy with all cash
+                holdings = cash / price
+                cash = 0.0
+            elif signal == 'SELL' and holdings > 0:
+                # sell all
+                cash = holdings * price
+                holdings = 0.0
+            # HOLD: do nothing
+        # Calculate total value at this date
+        total_value = cash + holdings * price
+        portfolio.append((date, total_value))
 
-# ---------- 3. 情感分析（VADER） ----------
-def analyze_sentiment(news_df):
-    print("🧠 正在进行情感分析（VADER）...")
-    analyzer = SentimentIntensityAnalyzer()
+    portfolio_df = pd.DataFrame(portfolio, columns=['Date', 'Portfolio_Value'])
+    portfolio_df.set_index('Date', inplace=True)
+    final_value = portfolio_df.iloc[-1]['Portfolio_Value']
+    return final_value, portfolio_df
 
-    def get_compound(text):
-        if pd.isna(text) or text == '':
-            return 0.0
-        text = str(text)[:3000]
-        return analyzer.polarity_scores(text)['compound']
+# ------------------ 5. Performance Metrics ------------------
+def calculate_metrics(start_value, end_value, start_date, end_date):
+    """Calculate total return and annualized return."""
+    total_return = (end_value - start_value) / start_value
+    days = (end_date - start_date).days
+    if days > 0:
+        annualized = (1 + total_return) ** (365 / days) - 1
+    else:
+        annualized = total_return
+    return total_return, annualized
 
-    news_df['full_text'] = news_df['title'].fillna('') + " " + news_df['body'].fillna('')
-    news_df['sentiment'] = news_df['full_text'].apply(get_compound)
-
-    # 按天聚合
-    news_df['date'] = news_df['datetime'].dt.date
-    daily_sentiment = news_df.groupby('date')['sentiment'].mean().reset_index()
-    daily_sentiment['date'] = pd.to_datetime(daily_sentiment['date'])
-    daily_sentiment = daily_sentiment.rename(columns={'sentiment': 'avg_sentiment'})
-    print(f"✅ 情感分析完成，覆盖 {len(daily_sentiment)} 个交易日")
-    return daily_sentiment
-
-
-# ---------- 4. 回测 ----------
-def backtest(price_df, daily_sentiment, initial_capital=10000.0):
-    df = price_df.copy()
-    df['date'] = df.index.date
-    df['date'] = pd.to_datetime(df['date'])
-
-    df = df.merge(daily_sentiment, on='date', how='left')
-    df['avg_sentiment'] = df['avg_sentiment'].fillna(0)
-
-    df['raw_signal'] = 0
-    df.loc[df['avg_sentiment'] > 0.1, 'raw_signal'] = 1
-    df.loc[df['avg_sentiment'] < -0.1, 'raw_signal'] = -1
-    df['signal'] = df['raw_signal'].shift(1).fillna(0)  # 次日执行
-
-    cash = initial_capital
-    position = 0.0
-    trade_log = []
-
-    for i in range(1, len(df)):
-        row = df.iloc[i]
-        price = row['Open']
-        date = row['date']
-        signal = row['signal']
-        if signal == 1 and cash > 0:
-            position = cash / price
-            cash = 0.0
-            trade_log.append({'date': date, 'action': 'BUY', 'price': price})
-        elif signal == -1 and position > 0:
-            cash = position * price
-            position = 0.0
-            trade_log.append({'date': date, 'action': 'SELL', 'price': price})
-
-    final_price = df.iloc[-1]['Close']
-    final_value = cash + position * final_price
-    total_days = (df.iloc[-1]['date'] - df.iloc[0]['date']).days
-    if total_days <= 0:
-        total_days = 365
-    total_return = (final_value / initial_capital) - 1
-    annual_return = (1 + total_return) ** (365 / total_days) - 1
-
-    bh_final_price = df.iloc[-1]['Close']
-    bh_initial_price = df.iloc[0]['Open']
-    bh_total_return = (bh_final_price / bh_initial_price) - 1
-    bh_annual_return = (1 + bh_total_return) ** (365 / total_days) - 1
-
-    print("\n" + "=" * 50)
-    print("📊 回测结果")
-    print("=" * 50)
-    print(f"起始资金: ${initial_capital:,.2f}")
-    print(f"最终资产: ${final_value:,.2f}")
-    print(f"策略总收益率: {total_return * 100:.2f}%")
-    print(f"策略年化收益率: {annual_return * 100:.2f}%")
-    print("-" * 50)
-    print(f"Buy&Hold 初始价格: ${bh_initial_price:,.2f}")
-    print(f"Buy&Hold 最终价格: ${bh_final_price:,.2f}")
-    print(f"Buy&Hold 总收益率: {bh_total_return * 100:.2f}%")
-    print(f"Buy&Hold 年化收益率: {bh_annual_return * 100:.2f}%")
-    print("-" * 50)
-    print(f"📈 策略 vs B&H: {(annual_return - bh_annual_return) * 100:.2f}% 年化差额")
-    print(f"交易次数: {len(trade_log)} 次")
-    print("=" * 50)
-    return df, trade_log, annual_return, bh_annual_return
-
-
-# ---------- 主程序 ----------
+# ------------------ Main ------------------
 def main():
-    print("🚀 新闻交易系统启动（使用 akshare 数据源）")
-    print("-" * 40)
+    # Load data
+    price = load_price_data('bitcoin_price.csv')
+    news = load_news_data('news.csv')
 
-    # 1. 价格数据（可自行更改股票代码，如 '000001' 上证指数）
-    price_df = fetch_price_data(symbol="000858",
-                                start_date="2025-07-23",
-                                end_date="2026-07-23")
+    # Ensure price and news have same timezone naive (already parsed)
+    # Generate signals
+    signals = generate_signals(news, price, threshold=0.1)
+    print(f"Generated {len(signals)} trading signals.")
+    print("Signal counts:\n", signals.value_counts())
 
-    # 2. 新闻数据
-    news_df = fetch_news(symbol="000858", max_days=365)
+    # Backtest strategy
+    initial_cash = 10000.0
+    final_value, portfolio = backtest(price, signals, initial_cash)
 
-    # 3. 情感分析
-    daily_sentiment = analyze_sentiment(news_df)
+    # Buy&Hold: start with all cash, buy at first day, hold till end
+    start_date = price.index.min()
+    end_date = price.index.max()
+    first_price = price.loc[start_date]
+    last_price = price.loc[end_date]
+    bh_final = (initial_cash / first_price) * last_price  # assuming buy at first price with all cash
+    bh_total_return = (bh_final - initial_cash) / initial_cash
+    bh_annualized = (1 + bh_total_return) ** (365 / (end_date - start_date).days) - 1
 
-    # 4. 回测
-    df_result, trade_log, strategy_ret, bh_ret = backtest(price_df, daily_sentiment)
+    # Strategy metrics
+    strat_total_return = (final_value - initial_cash) / initial_cash
+    strat_annualized = (1 + strat_total_return) ** (365 / (end_date - start_date).days) - 1
 
-    if trade_log:
-        print("\n📝 最近 5 笔交易记录:")
-        for log in trade_log[-5:]:
-            print(f"  {log['date'].date()} - {log['action']} @ ${log['price']:.2f}")
-
-    print("\n✅ 作业全部完成！")
-
+    # Print results
+    print("\n" + "="*50)
+    print(f"Backtest period: {start_date.date()} to {end_date.date()} ({(end_date - start_date).days} days)")
+    print(f"Initial capital: ${initial_cash:,.2f}")
+    print(f"Strategy final value: ${final_value:,.2f}")
+    print(f"Strategy total return: {strat_total_return:.2%}")
+    print(f"Strategy annualized return: {strat_annualized:.2%}")
+    print("\nBuy&Hold final value: ${bh_final:,.2f}")
+    print(f"Buy&Hold total return: {bh_total_return:.2%}")
+    print(f"Buy&Hold annualized return: {bh_annualized:.2%}")
+    print(f"\nStrategy vs Buy&Hold: {strat_annualized - bh_annualized:.2%} annualized difference")
+    print("="*50)
 
 if __name__ == "__main__":
     main()
