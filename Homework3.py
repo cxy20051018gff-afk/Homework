@@ -4,6 +4,8 @@ Reads local CSV files: bitcoin_price.csv (columns: Date, Close)
 and news.csv (columns: Date, Text).
 If files not found, downloads price data from Yahoo Finance and creates synthetic news.
 Runs backtest, prints annualized profit and comparison with Buy&Hold.
+Data from:https://cn.investing.com/crypto/bitcoin/historical-data
+News from:https://finance.sina.com.cn/stock/usstock/c/2026-07-24/doc-iniiwvke9298667.shtml
 """
 
 import pandas as pd
