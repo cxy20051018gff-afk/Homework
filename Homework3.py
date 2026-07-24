@@ -132,15 +132,17 @@ def backtest(price_series, signals, initial_cash=10000):
     """
     # Create a full date range from price_series
     full_dates = price_series.index
-    # Merge signals into full timeline (forward fill? Actually we only act on signal days)
-    # We'll process day by day
     cash = initial_cash
     holdings = 0.0  # amount of BTC
     portfolio = []  # list of (date, total_value)
 
-    # Get price at each date
+    # Process day by day
     for date in full_dates:
-        price = price_series.loc[date]
+        price = price_series.at[date]
+        if isinstance(price, pd.Series):
+            price = price.iloc[0]
+        price = float(price)
+
         # Check if there is a signal for this date
         if date in signals.index:
             signal = signals.loc[date]
